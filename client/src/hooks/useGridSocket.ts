@@ -14,7 +14,7 @@ export interface GridState {
 
 const WS_URL = import.meta.env.DEV
   ? `ws://${window.location.hostname}:3001`
-  : `ws://${window.location.host}`
+  : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`
 
 const ANIM_MS = 700
 

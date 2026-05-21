@@ -12,7 +12,8 @@ const COOLDOWN_MS = 3000;
 
 // ── Database ────────────────────────────────────────────────────────────────
 
-const db = new Database(path.join(__dirname, 'grid.db'));
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'grid.db');
+const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 
 db.exec(`
