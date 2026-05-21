@@ -1,52 +1,39 @@
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const http = require('http');
-const Database = require('better-sqlite3');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 
-const GRID_COLS = 32;
-const GRID_ROWS = 32;
-const TOTAL_CELLS = GRID_COLS * GRID_ROWS; // 1024
+const TOTAL_CELLS = 32 * 32; // 1024
 const COOLDOWN_MS = 3000;
 
-// ── Database ────────────────────────────────────────────────────────────────
+// ── In-memory grid state ─────────────────────────────────────────────────────
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'grid.db');
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
+const grid = Array.from({ length: TOTAL_CELLS }, (_, id) => ({
+  id,
+  owner_id:    null,
+  owner_name:  null,
+  owner_color: null,
+  claimed_at:  null,
+}));
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS cells (
-    id          INTEGER PRIMARY KEY,
-    owner_id    TEXT    DEFAULT NULL,
-    owner_name  TEXT    DEFAULT NULL,
-    owner_color TEXT    DEFAULT NULL,
-    claimed_at  INTEGER DEFAULT NULL
-  )
-`);
-
-const cellCount = db.prepare('SELECT COUNT(*) as c FROM cells').get().c;
-if (cellCount === 0) {
-  const insert = db.prepare('INSERT INTO cells (id) VALUES (?)');
-  db.transaction(() => {
-    for (let i = 0; i < TOTAL_CELLS; i++) insert.run(i);
-  })();
-  console.log(`Initialised ${TOTAL_CELLS} cells`);
+function getLeaderboard() {
+  const counts = new Map(); // userId → { name, color, count }
+  for (const cell of grid) {
+    if (!cell.owner_id) continue;
+    if (!counts.has(cell.owner_id)) {
+      counts.set(cell.owner_id, { name: cell.owner_name, color: cell.owner_color, count: 0 });
+    }
+    counts.get(cell.owner_id).count++;
+  }
+  return [...counts.values()]
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10);
 }
 
-// Prepared statements
-const stmtGetGrid        = db.prepare('SELECT id, owner_id, owner_name, owner_color, claimed_at FROM cells ORDER BY id');
-const stmtClaimCell      = db.prepare('UPDATE cells SET owner_id=?, owner_name=?, owner_color=?, claimed_at=? WHERE id=?');
-const stmtLeaderboard    = db.prepare(`
-  SELECT owner_name AS name, owner_color AS color, COUNT(*) AS count
-  FROM cells
-  WHERE owner_id IS NOT NULL
-  GROUP BY owner_id
-  ORDER BY count DESC
-  LIMIT 10
-`);
-const stmtTotalClaimed   = db.prepare('SELECT COUNT(*) AS c FROM cells WHERE owner_id IS NOT NULL');
+function getTotalClaimed() {
+  return grid.filter(c => c.owner_id !== null).length;
+}
 
 // ── HTTP + WebSocket server ──────────────────────────────────────────────────
 
@@ -59,7 +46,7 @@ app.get('*', (_, res) => res.sendFile(path.join(__dirname, '../client/dist/index
 
 // ── User generation ──────────────────────────────────────────────────────────
 
-const ADJ   = ['Swift','Bold','Bright','Calm','Clever','Dark','Daring','Epic','Fierce','Grand','Happy','Keen','Lucky','Magic','Noble','Proud','Quick','Sharp','Wise','Zany','Jade','Neon','Cosmic','Savage','Royal'];
+const ADJ   = ['Swift','Bold','Bright','Calm','Clever','Dark','Daring','Epic','Fierce','Grand','Happy','Keen','Lucky','Magic','Noble','Proud','Quick','Sharp','Wise','Jade','Neon','Cosmic','Savage','Royal'];
 const NOUN  = ['Fox','Bear','Eagle','Wolf','Tiger','Lion','Hawk','Raven','Panda','Shark','Lynx','Cobra','Falcon','Dragon','Storm','Blaze','Comet','Quasar','Nova','Titan','Specter','Vortex','Cipher','Nomad','Flux'];
 const COLORS = [
   '#FF6B6B','#FF9F43','#FECA57','#48DBFB','#FF9FF3',
@@ -76,7 +63,7 @@ function genUser() {
   return { name: `${adj} ${noun}`, color };
 }
 
-// ── State ────────────────────────────────────────────────────────────────────
+// ── Server state ─────────────────────────────────────────────────────────────
 
 const clients   = new Map(); // ws → { userId, userName, userColor }
 const cooldowns = new Map(); // userId → lastClaimTimestamp
@@ -104,19 +91,17 @@ wss.on('connection', (ws) => {
   console.log(`+ ${userName} connected  (${clients.size} online)`);
 
   send(ws, {
-    type: 'init',
+    type:         'init',
     userId,
     userName,
     userColor,
-    grid:         stmtGetGrid.all(),
-    leaderboard:  stmtLeaderboard.all(),
-    totalClaimed: stmtTotalClaimed.get().c,
+    grid,
+    leaderboard:  getLeaderboard(),
+    totalClaimed: getTotalClaimed(),
     onlineCount:  clients.size,
   });
 
   broadcast({ type: 'online_count', count: clients.size });
-
-  // ── Message handler ────────────────────────────────────────────────────────
 
   ws.on('message', (raw) => {
     try {
@@ -137,7 +122,14 @@ wss.on('connection', (ws) => {
           return;
         }
 
-        stmtClaimCell.run(user.userId, user.userName, user.userColor, now, cellId);
+        // Update in-memory grid
+        grid[cellId] = {
+          id:          cellId,
+          owner_id:    user.userId,
+          owner_name:  user.userName,
+          owner_color: user.userColor,
+          claimed_at:  now,
+        };
         cooldowns.set(user.userId, now);
 
         broadcast({
@@ -151,8 +143,8 @@ wss.on('connection', (ws) => {
 
         broadcast({
           type:         'leaderboard_update',
-          leaderboard:  stmtLeaderboard.all(),
-          totalClaimed: stmtTotalClaimed.get().c,
+          leaderboard:  getLeaderboard(),
+          totalClaimed: getTotalClaimed(),
         });
       }
     } catch (err) {
